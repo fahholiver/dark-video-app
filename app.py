@@ -249,6 +249,30 @@ if st.session_state.history:
             st.divider()
             st.markdown("**🎥 Vídeo final (imagens + narração)**")
 
+            text_key = f"voiceover_text_{item['id']}"
+            if text_key not in st.session_state:
+                st.session_state[text_key] = extract_voiceover_script(item["output"])
+
+            st.text_area(
+                "Texto da narração (edite antes de gerar o vídeo, se quiser)",
+                key=text_key,
+                height=160,
+            )
+
+            col_a, col_b = st.columns([1, 1])
+            with col_a:
+                show_captions = st.checkbox(
+                    "Mostrar legendas no vídeo", value=True, key=f"captions_on_{item['id']}"
+                )
+            with col_b:
+                caption_mode = st.radio(
+                    "Estilo da legenda",
+                    ["Palavra por palavra", "2-3 palavras por vez"],
+                    horizontal=True,
+                    disabled=not show_captions,
+                    key=f"caption_mode_{item['id']}",
+                )
+
             video_key = f"video_path_{item['id']}"
             if st.button("Gerar vídeo", key=f"genvid_{item['id']}"):
                 try:
@@ -259,7 +283,10 @@ if st.session_state.history:
                         build_video,
                     )
 
-                    voiceover_text = extract_voiceover_script(item["output"])
+                    voiceover_text = st.session_state[text_key].strip()
+                    if not voiceover_text:
+                        st.error("O texto da narração está vazio.")
+                        st.stop()
 
                     progress = st.progress(0.0, text="Gerando narração...")
 
@@ -275,7 +302,11 @@ if st.session_state.history:
                             "Não achei imagens no Met Museum agora (rede instável?). Tenta de novo."
                         )
                     else:
-                        captions = group_captions(word_boundaries, words_per_caption=2)
+                        if show_captions:
+                            words_per_caption = 1 if caption_mode == "Palavra por palavra" else 2
+                            captions = group_captions(word_boundaries, words_per_caption=words_per_caption)
+                        else:
+                            captions = []
 
                         def _cb(pct):
                             progress.progress(min(pct, 1.0), text="Montando o vídeo...")
