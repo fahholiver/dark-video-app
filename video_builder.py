@@ -17,10 +17,12 @@ import gc
 import random
 import asyncio
 import tempfile
+import subprocess
 
 import requests
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
+import imageio_ffmpeg
 
 # moviepy 1.0.3 ainda chama Image.ANTIALIAS internamente pro resize, mas o
 # Pillow >= 10 removeu esse atributo (virou Image.LANCZOS / Resampling.LANCZOS).
@@ -48,9 +50,14 @@ from moviepy.editor import (
 CANVAS_W, CANVAS_H = 640, 1138
 MAX_DOWNLOAD_DIM = 960  # baixa a imagem original antes do crop, pra economizar RAM
 
-# Acima disso o processamento fica pesado demais pro plano grátis (muitos
-# frames pra renderizar). O app avisa o usuário antes de deixar gerar.
-RECOMMENDED_MAX_SECONDS = 60
+# Vídeos são renderizados em pedaços de ~CHUNK_SECONDS e depois colados sem
+# recodificar. Isso mantém o uso de memória praticamente constante, não
+# importa se o vídeo final tem 30s ou alguns minutos.
+CHUNK_SECONDS = 12
+
+# Acima disso o processamento demora mais (mais pedaços pra renderizar), mas
+# continua funcionando de forma leve graças à renderização em chunks.
+RECOMMENDED_MAX_SECONDS = 180
 
 MET_SEARCH_URL = "https://collectionapi.metmuseum.org/public/collection/v1/search"
 MET_OBJECT_URL = "https://collectionapi.metmuseum.org/public/collection/v1/objects/{}"
@@ -269,101 +276,109 @@ def _ken_burns_clip(pil_img: Image.Image, duration: float, zoom_end: float = 1.1
     return CompositeVideoClip([zoomed], size=(CANVAS_W, CANVAS_H)).set_duration(duration)
 
 
-def build_video(
-    image_urls: list,
-    audio_path: str,
-    captions: list,
-    seconds_per_image: float = 2.5,
-    out_path: str = "output.mp4",
-    progress_callback=None,
-) -> str:
-    # Todos os clipes do moviepy abertos aqui (áudio, imagens, vídeo final)
-    # precisam ser fechados no final — senão o processo do Streamlit vai
-    # acumulando memória/handles a cada vídeo gerado na mesma sessão, até
-    # estourar a RAM do plano grátis. Por isso tudo roda dentro de um
-    # try/finally que fecha tudo, aconteça o que acontecer.
-    audio_clip = None
+def _run_ffmpeg(args: list):
+    ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
+    result = subprocess.run(
+        [ffmpeg_exe, "-y", *args],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"ffmpeg falhou: {result.stdout.decode('utf-8', errors='ignore')[-800:]}"
+        )
+
+
+def _plan_segments(num_images: int, num_slots: int, slot_dur: float, flash_dur: float) -> list:
+    """Timeline completa (sem áudio/legenda ainda): lista de segmentos com
+    tempo absoluto, cada um sendo uma imagem (Ken Burns) ou um flash preto."""
+    segments = []
+    t = 0.0
+    for i in range(num_slots):
+        segments.append(
+            {"type": "image", "image_index": i % num_images, "start": t, "duration": slot_dur}
+        )
+        t += slot_dur
+        if i < num_slots - 1:
+            segments.append({"type": "flash", "start": t, "duration": flash_dur})
+            t += flash_dur
+    return segments
+
+
+def _group_into_chunks(segments: list, chunk_seconds: float) -> list:
+    """Agrupa segmentos consecutivos em blocos de ~chunk_seconds, sem cortar
+    nenhum segmento no meio (cada imagem/flash fica inteiro num só chunk)."""
+    chunks = []
+    current = []
+    current_start = 0.0
+    elapsed_in_chunk = 0.0
+    for seg in segments:
+        if current and elapsed_in_chunk + seg["duration"] > chunk_seconds:
+            chunks.append({"segments": current, "start": current_start})
+            current = []
+            current_start = seg["start"]
+            elapsed_in_chunk = 0.0
+        current.append(seg)
+        elapsed_in_chunk += seg["duration"]
+    if current:
+        chunks.append({"segments": current, "start": current_start})
+    return chunks
+
+
+def _render_chunk(
+    chunk: dict, pil_images: list, captions: list, out_path: str
+) -> None:
+    """Renderiza um pedaço pequeno do vídeo (imagens + flashes + legendas,
+    sem áudio) e fecha tudo antes de retornar, pra não acumular memória."""
+    clips = []
     all_clips = []
     final = None
     try:
-        audio_clip = AudioFileClip(audio_path)
-        total_duration = audio_clip.duration
-
-        pil_images = []
-        for i, url in enumerate(image_urls):
-            img = _download_image(url)
-            if img:
-                pil_images.append(_cover_resize(img, CANVAS_W, CANVAS_H))
-            if progress_callback:
-                progress_callback(0.1 + 0.3 * (i + 1) / max(len(image_urls), 1))
-
-        if not pil_images:
-            raise RuntimeError(
-                "Não consegui baixar nenhuma imagem do Met Museum. Tenta gerar de novo."
-            )
-
-        num_slots = max(1, round(total_duration / seconds_per_image))
-        slots = [pil_images[i % len(pil_images)] for i in range(num_slots)]
-        flash_dur = 0.12
-        slot_dur = max(
-            0.5, (total_duration - flash_dur * (num_slots - 1)) / num_slots
-        )
-
-        clips = []
-        for i, img in enumerate(slots):
-            kb_clip = _ken_burns_clip(img, slot_dur)
-            clips.append(kb_clip)
-            all_clips.append(kb_clip)
-            if i < num_slots - 1:
-                flash = ColorClip((CANVAS_W, CANVAS_H), color=(0, 0, 0)).set_duration(flash_dur)
-                clips.append(flash)
-                all_clips.append(flash)
-
-        # libera as imagens PIL/numpy assim que os clipes já foram criados
-        pil_images = None
-        slots = None
-        gc.collect()
+        for seg in chunk["segments"]:
+            if seg["type"] == "image":
+                kb = _ken_burns_clip(pil_images[seg["image_index"]], seg["duration"])
+            else:
+                kb = ColorClip((CANVAS_W, CANVAS_H), color=(0, 0, 0)).set_duration(seg["duration"])
+            clips.append(kb)
+            all_clips.append(kb)
 
         video = concatenate_videoclips(clips, method="compose")
-        video = video.set_duration(min(video.duration, total_duration))
         all_clips.append(video)
+        chunk_duration = video.duration
+        chunk_start = chunk["start"]
 
         caption_clips = []
         for cap in captions:
+            local_start = cap["start"] - chunk_start
+            local_end = cap["end"] - chunk_start
+            local_start = max(0.0, local_start)
+            local_end = min(chunk_duration, local_end)
+            if local_end <= local_start:
+                continue
             cap_img = _make_caption_image(cap["text"])
             cc = (
                 ImageClip(cap_img)
-                .set_start(cap["start"])
-                .set_duration(max(cap["end"] - cap["start"], 0.25))
+                .set_start(local_start)
+                .set_duration(local_end - local_start)
                 .set_position(("center", "center"))
             )
             caption_clips.append(cc)
             all_clips.append(cc)
 
         final = CompositeVideoClip([video, *caption_clips], size=(CANVAS_W, CANVAS_H))
-        final = final.set_duration(total_duration).set_audio(audio_clip)
-
-        if progress_callback:
-            progress_callback(0.6)
+        final = final.set_duration(chunk_duration)
 
         final.write_videofile(
             out_path,
             fps=20,  # 20fps é suficiente pro efeito Ken Burns e é bem mais leve pra CPU
             codec="libx264",
-            audio_codec="aac",
+            audio=False,
             threads=2,
             preset="ultrafast",  # prioriza CPU baixa em vez de compressão máxima
             bitrate="1500k",
             logger=None,
         )
-
-        if progress_callback:
-            progress_callback(1.0)
-
-        return out_path
     finally:
-        # fecha tudo (processos ffmpeg internos, arquivos abertos) pra não
-        # vazar memória entre gerações consecutivas de vídeo
         for c in all_clips:
             try:
                 c.close()
@@ -374,9 +389,100 @@ def build_video(
                 final.close()
             except Exception:
                 pass
-        if audio_clip is not None:
+        gc.collect()
+
+
+def build_video(
+    image_urls: list,
+    audio_path: str,
+    captions: list,
+    seconds_per_image: float = 2.5,
+    out_path: str = "output.mp4",
+    progress_callback=None,
+) -> str:
+    """Monta o vídeo final renderizando em pedaços pequenos (CHUNK_SECONDS)
+    e colando tudo no final sem recodificar — mantém o uso de memória baixo
+    e praticamente constante, mesmo pra vídeos mais longos (70s, 2min...)."""
+    audio_clip = AudioFileClip(audio_path)
+    try:
+        total_duration = audio_clip.duration
+    finally:
+        audio_clip.close()
+
+    pil_images = []
+    for i, url in enumerate(image_urls):
+        img = _download_image(url)
+        if img:
+            pil_images.append(_cover_resize(img, CANVAS_W, CANVAS_H))
+        if progress_callback:
+            progress_callback(0.05 + 0.15 * (i + 1) / max(len(image_urls), 1))
+
+    if not pil_images:
+        raise RuntimeError(
+            "Não consegui baixar nenhuma imagem do Met Museum. Tenta gerar de novo."
+        )
+
+    num_slots = max(1, round(total_duration / seconds_per_image))
+    flash_dur = 0.12
+    slot_dur = max(0.5, (total_duration - flash_dur * (num_slots - 1)) / num_slots)
+
+    segments = _plan_segments(len(pil_images), num_slots, slot_dur, flash_dur)
+    chunks = _group_into_chunks(segments, CHUNK_SECONDS)
+
+    tmp_dir = tempfile.mkdtemp(prefix="darkvid_")
+    chunk_paths = []
+    try:
+        for idx, chunk in enumerate(chunks):
+            chunk_path = os.path.join(tmp_dir, f"chunk_{idx:03d}.mp4")
+            _render_chunk(chunk, pil_images, captions, chunk_path)
+            chunk_paths.append(chunk_path)
+            if progress_callback:
+                progress_callback(0.2 + 0.6 * (idx + 1) / max(len(chunks), 1))
+
+        # 1) cola todos os pedaços de vídeo (sem áudio) sem recodificar —
+        #    operação leve, só copia os streams.
+        list_file = os.path.join(tmp_dir, "list.txt")
+        with open(list_file, "w") as f:
+            for p in chunk_paths:
+                f.write(f"file '{p}'\n")
+        silent_path = os.path.join(tmp_dir, "silent.mp4")
+        _run_ffmpeg(["-f", "concat", "-safe", "0", "-i", list_file, "-c", "copy", silent_path])
+
+        if progress_callback:
+            progress_callback(0.9)
+
+        # 2) adiciona a narração completa por cima (só recodifica o áudio,
+        #    o vídeo é copiado — também leve).
+        _run_ffmpeg(
+            [
+                "-i", silent_path,
+                "-i", audio_path,
+                "-map", "0:v:0",
+                "-map", "1:a:0",
+                "-c:v", "copy",
+                "-c:a", "aac",
+                "-shortest",
+                out_path,
+            ]
+        )
+
+        if progress_callback:
+            progress_callback(1.0)
+
+        return out_path
+    finally:
+        for p in chunk_paths:
             try:
-                audio_clip.close()
-            except Exception:
+                os.remove(p)
+            except OSError:
                 pass
+        try:
+            os.remove(os.path.join(tmp_dir, "list.txt"))
+            os.remove(os.path.join(tmp_dir, "silent.mp4"))
+        except OSError:
+            pass
+        try:
+            os.rmdir(tmp_dir)
+        except OSError:
+            pass
         gc.collect()
