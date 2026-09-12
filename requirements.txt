@@ -1,0 +1,7 @@
+streamlit
+requests
+edge-tts>=6.1.9
+moviepy==1.0.3
+Pillow
+numpy
+imageio-ffmpeg
