@@ -204,6 +204,18 @@ else:
 low, high = estimate_word_range(duration_seconds)
 st.caption(f"Faixa de palavras alvo pra narração: **{low}–{high} palavras** (~130–150 wpm).")
 
+try:
+    from video_builder import RECOMMENDED_MAX_SECONDS
+except Exception:
+    RECOMMENDED_MAX_SECONDS = 60
+if duration_seconds > RECOMMENDED_MAX_SECONDS:
+    st.warning(
+        f"⚠️ Vídeos acima de {RECOMMENDED_MAX_SECONDS}s pedem bem mais processamento "
+        "(mais imagens + mais frames pra renderizar). No plano grátis do Streamlit "
+        "Cloud isso pode travar ou dar erro por falta de memória. Se der erro, "
+        "tenta um valor menor."
+    )
+
 if "history" not in st.session_state:
     st.session_state.history = []
 
@@ -312,16 +324,24 @@ if st.session_state.history:
                             progress.progress(min(pct, 1.0), text="Montando o vídeo...")
 
                         out_path = f"/tmp/video_{item['id']}.mp4"
-                        build_video(
-                            image_urls,
-                            audio_path,
-                            captions,
-                            seconds_per_image=seconds_per_image,
-                            out_path=out_path,
-                            progress_callback=_cb,
-                        )
-                        st.session_state[video_key] = out_path
-                        progress.progress(1.0, text="Pronto!")
+                        try:
+                            build_video(
+                                image_urls,
+                                audio_path,
+                                captions,
+                                seconds_per_image=seconds_per_image,
+                                out_path=out_path,
+                                progress_callback=_cb,
+                            )
+                            st.session_state[video_key] = out_path
+                            progress.progress(1.0, text="Pronto!")
+                        finally:
+                            # o mp3 temporário da narração já foi "queimado"
+                            # dentro do vídeo final, não precisa mais dele
+                            try:
+                                os.remove(audio_path)
+                            except OSError:
+                                pass
                 except Exception as e:
                     st.error(f"Deu erro gerando o vídeo: {e}")
 
