@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import io
 import os
+import gc
 import random
 import asyncio
 import tempfile
@@ -41,11 +42,15 @@ from moviepy.editor import (
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
-# Resolução reduzida de propósito (720x1280 em vez de 1080x1920) pra manter o
+# Resolução reduzida de propósito (640x1138 em vez de 1080x1920) pra manter o
 # processamento leve — importante rodando no plano grátis do Streamlit Cloud,
 # que tem CPU/RAM compartilhada e limitada.
-CANVAS_W, CANVAS_H = 720, 1280
-MAX_DOWNLOAD_DIM = 1280  # baixa a imagem original antes do crop, pra economizar RAM
+CANVAS_W, CANVAS_H = 640, 1138
+MAX_DOWNLOAD_DIM = 960  # baixa a imagem original antes do crop, pra economizar RAM
+
+# Acima disso o processamento fica pesado demais pro plano grátis (muitos
+# frames pra renderizar). O app avisa o usuário antes de deixar gerar.
+RECOMMENDED_MAX_SECONDS = 60
 
 MET_SEARCH_URL = "https://collectionapi.metmuseum.org/public/collection/v1/search"
 MET_OBJECT_URL = "https://collectionapi.metmuseum.org/public/collection/v1/objects/{}"
@@ -272,69 +277,106 @@ def build_video(
     out_path: str = "output.mp4",
     progress_callback=None,
 ) -> str:
-    audio_clip = AudioFileClip(audio_path)
-    total_duration = audio_clip.duration
+    # Todos os clipes do moviepy abertos aqui (áudio, imagens, vídeo final)
+    # precisam ser fechados no final — senão o processo do Streamlit vai
+    # acumulando memória/handles a cada vídeo gerado na mesma sessão, até
+    # estourar a RAM do plano grátis. Por isso tudo roda dentro de um
+    # try/finally que fecha tudo, aconteça o que acontecer.
+    audio_clip = None
+    all_clips = []
+    final = None
+    try:
+        audio_clip = AudioFileClip(audio_path)
+        total_duration = audio_clip.duration
 
-    pil_images = []
-    for i, url in enumerate(image_urls):
-        img = _download_image(url)
-        if img:
-            pil_images.append(_cover_resize(img, CANVAS_W, CANVAS_H))
-        if progress_callback:
-            progress_callback(0.1 + 0.3 * (i + 1) / max(len(image_urls), 1))
+        pil_images = []
+        for i, url in enumerate(image_urls):
+            img = _download_image(url)
+            if img:
+                pil_images.append(_cover_resize(img, CANVAS_W, CANVAS_H))
+            if progress_callback:
+                progress_callback(0.1 + 0.3 * (i + 1) / max(len(image_urls), 1))
 
-    if not pil_images:
-        raise RuntimeError(
-            "Não consegui baixar nenhuma imagem do Met Museum. Tenta gerar de novo."
-        )
-
-    num_slots = max(1, round(total_duration / seconds_per_image))
-    slots = [pil_images[i % len(pil_images)] for i in range(num_slots)]
-    flash_dur = 0.12
-    slot_dur = max(
-        0.5, (total_duration - flash_dur * (num_slots - 1)) / num_slots
-    )
-
-    clips = []
-    for i, img in enumerate(slots):
-        clips.append(_ken_burns_clip(img, slot_dur))
-        if i < num_slots - 1:
-            clips.append(
-                ColorClip((CANVAS_W, CANVAS_H), color=(0, 0, 0)).set_duration(flash_dur)
+        if not pil_images:
+            raise RuntimeError(
+                "Não consegui baixar nenhuma imagem do Met Museum. Tenta gerar de novo."
             )
 
-    video = concatenate_videoclips(clips, method="compose")
-    video = video.set_duration(min(video.duration, total_duration))
-
-    caption_clips = []
-    for cap in captions:
-        cap_img = _make_caption_image(cap["text"])
-        cc = (
-            ImageClip(cap_img)
-            .set_start(cap["start"])
-            .set_duration(max(cap["end"] - cap["start"], 0.25))
-            .set_position(("center", "center"))
+        num_slots = max(1, round(total_duration / seconds_per_image))
+        slots = [pil_images[i % len(pil_images)] for i in range(num_slots)]
+        flash_dur = 0.12
+        slot_dur = max(
+            0.5, (total_duration - flash_dur * (num_slots - 1)) / num_slots
         )
-        caption_clips.append(cc)
 
-    final = CompositeVideoClip([video, *caption_clips], size=(CANVAS_W, CANVAS_H))
-    final = final.set_duration(total_duration).set_audio(audio_clip)
+        clips = []
+        for i, img in enumerate(slots):
+            kb_clip = _ken_burns_clip(img, slot_dur)
+            clips.append(kb_clip)
+            all_clips.append(kb_clip)
+            if i < num_slots - 1:
+                flash = ColorClip((CANVAS_W, CANVAS_H), color=(0, 0, 0)).set_duration(flash_dur)
+                clips.append(flash)
+                all_clips.append(flash)
 
-    if progress_callback:
-        progress_callback(0.6)
+        # libera as imagens PIL/numpy assim que os clipes já foram criados
+        pil_images = None
+        slots = None
+        gc.collect()
 
-    final.write_videofile(
-        out_path,
-        fps=24,  # 24fps é suficiente pro efeito Ken Burns e é bem mais leve que 30
-        codec="libx264",
-        audio_codec="aac",
-        threads=2,
-        preset="veryfast",  # prioriza velocidade/CPU baixa em vez de compressão máxima
-        bitrate="1800k",
-        logger=None,
-    )
+        video = concatenate_videoclips(clips, method="compose")
+        video = video.set_duration(min(video.duration, total_duration))
+        all_clips.append(video)
 
-    if progress_callback:
-        progress_callback(1.0)
+        caption_clips = []
+        for cap in captions:
+            cap_img = _make_caption_image(cap["text"])
+            cc = (
+                ImageClip(cap_img)
+                .set_start(cap["start"])
+                .set_duration(max(cap["end"] - cap["start"], 0.25))
+                .set_position(("center", "center"))
+            )
+            caption_clips.append(cc)
+            all_clips.append(cc)
 
-    return out_path
+        final = CompositeVideoClip([video, *caption_clips], size=(CANVAS_W, CANVAS_H))
+        final = final.set_duration(total_duration).set_audio(audio_clip)
+
+        if progress_callback:
+            progress_callback(0.6)
+
+        final.write_videofile(
+            out_path,
+            fps=20,  # 20fps é suficiente pro efeito Ken Burns e é bem mais leve pra CPU
+            codec="libx264",
+            audio_codec="aac",
+            threads=2,
+            preset="ultrafast",  # prioriza CPU baixa em vez de compressão máxima
+            bitrate="1500k",
+            logger=None,
+        )
+
+        if progress_callback:
+            progress_callback(1.0)
+
+        return out_path
+    finally:
+        # fecha tudo (processos ffmpeg internos, arquivos abertos) pra não
+        # vazar memória entre gerações consecutivas de vídeo
+        for c in all_clips:
+            try:
+                c.close()
+            except Exception:
+                pass
+        if final is not None:
+            try:
+                final.close()
+            except Exception:
+                pass
+        if audio_clip is not None:
+            try:
+                audio_clip.close()
+            except Exception:
+                pass
+        gc.collect()
