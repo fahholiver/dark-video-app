@@ -21,6 +21,13 @@ import requests
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
+# moviepy 1.0.3 ainda chama Image.ANTIALIAS internamente pro resize, mas o
+# Pillow >= 10 removeu esse atributo (virou Image.LANCZOS / Resampling.LANCZOS).
+# Recria o alias antigo pra manter compatibilidade sem precisar prender a
+# versão do Pillow.
+if not hasattr(Image, "ANTIALIAS"):
+    Image.ANTIALIAS = Image.LANCZOS
+
 import edge_tts
 
 from moviepy.editor import (
@@ -34,7 +41,11 @@ from moviepy.editor import (
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
-CANVAS_W, CANVAS_H = 1080, 1920
+# Resolução reduzida de propósito (720x1280 em vez de 1080x1920) pra manter o
+# processamento leve — importante rodando no plano grátis do Streamlit Cloud,
+# que tem CPU/RAM compartilhada e limitada.
+CANVAS_W, CANVAS_H = 720, 1280
+MAX_DOWNLOAD_DIM = 1280  # baixa a imagem original antes do crop, pra economizar RAM
 
 MET_SEARCH_URL = "https://collectionapi.metmuseum.org/public/collection/v1/search"
 MET_OBJECT_URL = "https://collectionapi.metmuseum.org/public/collection/v1/objects/{}"
@@ -115,7 +126,9 @@ def fetch_classical_images(num_images: int, extra_queries: list | None = None) -
             obj = _fetch_object(oid)
             if not obj:
                 continue
-            img_url = obj.get("primaryImage") or obj.get("primaryImageSmall")
+            # Prioriza a versão "small" do Met (mais leve pra baixar e
+            # processar); só cai pra imagem full-size se não houver small.
+            img_url = obj.get("primaryImageSmall") or obj.get("primaryImage")
             if img_url:
                 image_urls.append(img_url)
 
@@ -126,7 +139,16 @@ def _download_image(url: str) -> Image.Image | None:
     try:
         r = requests.get(url, timeout=20)
         r.raise_for_status()
-        return Image.open(io.BytesIO(r.content)).convert("RGB")
+        img = Image.open(io.BytesIO(r.content)).convert("RGB")
+        # Reduz logo de cara se a imagem vier maior que o necessário —
+        # evita segurar imagens enormes na memória durante o processamento.
+        if max(img.size) > MAX_DOWNLOAD_DIM:
+            ratio = MAX_DOWNLOAD_DIM / max(img.size)
+            img = img.resize(
+                (max(1, int(img.width * ratio)), max(1, int(img.height * ratio))),
+                Image.LANCZOS,
+            )
+        return img
     except Exception:
         return None
 
@@ -303,11 +325,12 @@ def build_video(
 
     final.write_videofile(
         out_path,
-        fps=30,
+        fps=24,  # 24fps é suficiente pro efeito Ken Burns e é bem mais leve que 30
         codec="libx264",
         audio_codec="aac",
-        threads=4,
-        preset="medium",
+        threads=2,
+        preset="veryfast",  # prioriza velocidade/CPU baixa em vez de compressão máxima
+        bitrate="1800k",
         logger=None,
     )
 
